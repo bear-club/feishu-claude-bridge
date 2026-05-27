@@ -7,9 +7,16 @@ export interface ClaudeResult {
   isError: boolean;
 }
 
+export type ProgressCallback = (text: string) => void;
+
 export async function callClaude(
   prompt: string,
-  options: { cwd?: string; resume?: string; abortController?: AbortController }
+  options: {
+    cwd?: string;
+    resume?: string;
+    abortController?: AbortController;
+    onProgress?: ProgressCallback;
+  }
 ): Promise<ClaudeResult> {
   const model = process.env.CLAUDE_MODEL || "claude-opus-4-6";
 
@@ -30,6 +37,14 @@ export async function callClaude(
   })) {
     if (message.type === "system" && message.subtype === "init") {
       sessionId = message.session_id;
+    }
+    if (message.type === "assistant" && "content" in message) {
+      const textBlocks = (message.content as Array<{ type: string; text?: string }>)
+        .filter((b) => b.type === "text" && b.text)
+        .map((b) => b.text!);
+      if (textBlocks.length > 0 && options.onProgress) {
+        options.onProgress(textBlocks.join(""));
+      }
     }
     if (message.type === "result") {
       sessionId = message.session_id;

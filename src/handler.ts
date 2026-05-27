@@ -1,4 +1,4 @@
-import { sendText, sendCard } from "./feishu.js";
+import { sendText, sendCard, updateCard } from "./feishu.js";
 import {
   getSession,
   setSession,
@@ -11,9 +11,11 @@ import { callClaude } from "./claude.js";
 import { validateCwd, getDefaultCwd, getShortcutDirs } from "./path-guard.js";
 import { parseInput } from "./command-parser.js";
 import { enqueue, cancelQueue } from "./task-queue.js";
+import { splitByBytes } from "./split-message.js";
 import fs from "fs/promises";
 
 const TASK_TIMEOUT = 5 * 60 * 1000;
+const THROTTLE_MS = 3000;
 
 export const activeControllers = new Map<string, AbortController>();
 
@@ -64,13 +66,19 @@ function hr() {
 // --- Claude call ---
 
 async function handleClaude(chatId: string, prompt: string): Promise<void> {
-  if (activeControllers.has(chatId)) {
-    await sendText(chatId, "⏳ 上一个任务还在执行，已排队等待...");
-  } else {
-    await sendText(chatId, "⏳ 正在执行...");
+  const queued = enqueue(chatId, () => executeClaude(chatId, prompt));
+  if (queued === null) {
+    await sendCard(chatId, card("orange", "⚠️ 队列已满", [
+      md("当前有多个任务排队中，请稍后再试\n\n发送 /cancel 可取消所有任务"),
+    ]));
+    return;
   }
 
-  await enqueue(chatId, () => executeClaude(chatId, prompt));
+  if (activeControllers.has(chatId)) {
+    await sendText(chatId, "⏳ 上一个任务还在执行，已排队等待...");
+  }
+
+  await queued;
 }
 
 async function executeClaude(chatId: string, prompt: string): Promise<void> {
@@ -82,8 +90,26 @@ async function executeClaude(chatId: string, prompt: string): Promise<void> {
 
   const timer = setTimeout(() => controller.abort(), TASK_TIMEOUT);
 
+  const progressMsgId = await sendCard(chatId, card("blue", "⏳ 执行中", [
+    md("正在处理..."),
+  ]));
+
+  let lastUpdate = 0;
+  let latestProgress = "";
+
+  const onProgress = (text: string) => {
+    latestProgress = text;
+    const now = Date.now();
+    if (now - lastUpdate < THROTTLE_MS || !progressMsgId) return;
+    lastUpdate = now;
+    const preview = text.length > 500 ? text.slice(-500) : text;
+    updateCard(progressMsgId, card("blue", "⏳ 执行中", [
+      md(`\`\`\`\n${preview}\n\`\`\``),
+    ])).catch(() => {});
+  };
+
   try {
-    let result = await tryCallClaude(prompt, cwd, session?.sessionId, controller);
+    let result = await tryCallClaude(prompt, cwd, session?.sessionId, controller, onProgress);
 
     await setSession(chatId, {
       sessionId: result.sessionId,
@@ -94,20 +120,46 @@ async function executeClaude(chatId: string, prompt: string): Promise<void> {
     });
 
     const output = result.result || "（无输出）";
-    const prefix = result.isError ? "⚠️ " : "";
-    await sendText(chatId, `${prefix}${output}`);
+    const color = result.isError ? "red" : "green";
+    const title = result.isError ? "⚠️ 执行结果" : "✅ 执行完成";
+
+    const chunks = splitByBytes(output);
+
+    if (progressMsgId) {
+      await updateCard(progressMsgId, card(color, title, [
+        md(chunks[0]),
+      ])).catch(() => {});
+    }
+
+    for (let i = 1; i < chunks.length; i++) {
+      await sendCard(chatId, card(color, `${title} (${i + 1}/${chunks.length})`, [
+        md(chunks[i]),
+      ]));
+    }
   } catch (err) {
     if (controller.signal.aborted) {
-      await sendCard(chatId, card("orange", "⛔ 任务已取消", [
-        md("当前任务已被中断"),
-      ]));
+      if (progressMsgId) {
+        await updateCard(progressMsgId, card("orange", "⛔ 任务已取消", [
+          md("当前任务已被中断"),
+        ])).catch(() => {});
+      } else {
+        await sendCard(chatId, card("orange", "⛔ 任务已取消", [
+          md("当前任务已被中断"),
+        ]));
+      }
       return;
     }
     const errMsg = err instanceof Error ? err.message : String(err);
     console.error("[Claude 调用失败]", errMsg);
-    await sendCard(chatId, card("red", "❌ 执行失败", [
-      md(`\`\`\`\n${errMsg}\n\`\`\``),
-    ]));
+    if (progressMsgId) {
+      await updateCard(progressMsgId, card("red", "❌ 执行失败", [
+        md(`\`\`\`\n${errMsg}\n\`\`\``),
+      ])).catch(() => {});
+    } else {
+      await sendCard(chatId, card("red", "❌ 执行失败", [
+        md(`\`\`\`\n${errMsg}\n\`\`\``),
+      ]));
+    }
   } finally {
     clearTimeout(timer);
     activeControllers.delete(chatId);
@@ -118,16 +170,17 @@ async function tryCallClaude(
   prompt: string,
   cwd: string,
   resumeId: string | undefined,
-  controller: AbortController
+  controller: AbortController,
+  onProgress?: (text: string) => void
 ) {
   if (resumeId) {
     try {
-      return await callClaude(prompt, { cwd, resume: resumeId, abortController: controller });
+      return await callClaude(prompt, { cwd, resume: resumeId, abortController: controller, onProgress });
     } catch (err) {
       console.warn("[Session 恢复失败，新建会话]", (err as Error).message);
     }
   }
-  return await callClaude(prompt, { cwd, abortController: controller });
+  return await callClaude(prompt, { cwd, abortController: controller, onProgress });
 }
 
 // --- /new ---

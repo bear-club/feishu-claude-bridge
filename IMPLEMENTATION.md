@@ -1,4 +1,4 @@
-# 实现计划
+﻿# 实现计划
 
 > 进度标记：✅ 已完成 | 🔲 待实现
 
@@ -264,7 +264,7 @@ ALLOWED_DIRS=D:\play,D:\projects
 - 路径校验失败 → 检查 `.env` 中 `ALLOWED_DIRS` 配置
 - `data/sessions.json` 损坏 → 删除文件，会自动重建空映射
 
-## 第四阶段：并发控制与任务管理 🔲
+## 第四阶段：并发控制与任务管理 ✅
 
 ### 4.1 串行任务队列
 
@@ -309,30 +309,44 @@ const timer = setTimeout(() => controller.abort(), TIMEOUT);
 2. 发长任务后立刻 `/cancel` → 任务中断，收到取消提示
 3. 发一个必然超时的任务 → 5 分钟后收到超时提示
 
-## 第五阶段：输出优化 🔲
+## 第五阶段：输出优化 ✅
 
-### 5.1 飞书卡片消息替代纯文本
+### 5.1 结果卡片展示
 
-使用 `interactive` 类型卡片消息展示结果：
-- 代码块用 `column_set` + `markdown` 元素
-- 长文本分段
-- 支持通过 `PATCH` 更新已发送的卡片内容
+Claude 执行结果使用卡片消息展示，结构：
+- 标题：成功（绿色）/ 失败（红色）
+- 正文：markdown 格式，代码块自动高亮
 
-### 5.2 智能截断
+### 5.2 长输出分片发送
+
+不截断，保留完整输出。按飞书消息大小限制拆分为多条消息顺序发送。
+
+**拆分策略**：
+- 单条卡片正文控制在 **28KB**（UTF-8 字节数），为卡片结构 JSON 预留 2KB
+- 使用 `Buffer.byteLength(text, 'utf8')` 计算字节数
+- 拆分时尽量在换行符处断开，避免截断代码块中间
+- 第一条卡片带标题，后续分片标题标注"续 (2/3)"等序号
 
 ```typescript
-function truncateOutput(text: string, maxLen: number = 28000): string {
-  if (text.length <= maxLen) return text;
-  const head = text.slice(0, maxLen * 0.6);
-  const tail = text.slice(-maxLen * 0.3);
-  return `${head}\n\n... 省略 ${text.length - head.length - tail.length} 字符 ...\n\n${tail}`;
+function splitByBytes(text: string, maxBytes: number = 28000): string[] {
+  const chunks: string[] = [];
+  let remaining = text;
+  while (Buffer.byteLength(remaining, 'utf8') > maxBytes) {
+    // 从 maxBytes 位置向前找换行符断开
+    let cutPoint = findCutPoint(remaining, maxBytes);
+    chunks.push(remaining.slice(0, cutPoint));
+    remaining = remaining.slice(cutPoint);
+  }
+  if (remaining) chunks.push(remaining);
+  return chunks;
 }
 ```
 
 ### 5.3 消息更新（实时进度）
 
+执行过程中通过 PATCH 更新已发送的卡片，展示执行状态：
+
 ```typescript
-// 用 message_id 更新已发送的卡片
 await client.im.message.patch({
   path: { message_id: messageId },
   data: {
@@ -342,10 +356,19 @@ await client.im.message.patch({
 });
 ```
 
+**节流**：更新频率限制为每 3 秒最多一次（飞书 API 限流约 5 次/秒/应用，留余量）。
+
+**进度展示**：
+- 发送任务时立即发出"⏳ 执行中..."卡片，获取 `message_id`
+- Claude 流式输出过程中，节流更新卡片内容为当前输出片段
+- 执行完成后，用最终结果替换（或分片发送新消息）
+
 ### 5.4 验证
 
-1. 发一个会产生长输出的指令 → 输出被正确截断
-2. 执行过程中卡片消息有进度更新
+1. 发一个会产生长输出的指令（如"列出所有文件并显示内容"）→ 收到多条消息，内容完整无丢失
+2. 单条消息不超过飞书限制，不会发送失败
+3. 执行过程中卡片有进度更新
+4. 快速连续输出时更新频率不超过节流限制
 
 ## 目录结构
 
@@ -388,5 +411,5 @@ feishu-claude-bridge/
 | 第一阶段 | 飞书发消息，机器人原样回复 | ✅ 已验证 |
 | 第二阶段 | 飞书发指令，Claude 执行并返回结果 | ✅ 代码完成，待 .env 配置后验证 |
 | 第三阶段 | 连续对话有上下文；`/new` `/switch` 指令交互正常 | ✅ 代码完成，待验证 |
-| 第四阶段 | 连续消息串行执行；`/cancel` 能中断任务 | 🔲 |
-| 第五阶段 | 卡片消息展示结果；长输出正确���断 | 🔲 |
+| 第四阶段 | 连续消息串行执行；`/cancel` 能中断任务 | ✅ |
+| 第五阶段 | 卡片消息展示结果；长输出分片发送 | ✅ |

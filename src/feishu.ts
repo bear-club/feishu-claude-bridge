@@ -98,4 +98,13 @@ const wsClient = new lark.WSClient({
   appSecret: process.env.FEISHU_APP_SECRET!,
 });
 
+export async function updateCard(messageId: string, card: object): Promise<void> {
+  await client.im.message.patch({
+    path: { message_id: messageId },
+    data: {
+      content: JSON.stringify(card),
+    },
+  });
+}
+
 export { client, dispatcher, wsClient };
