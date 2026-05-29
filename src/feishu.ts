@@ -30,8 +30,13 @@ function isStaleMessage(createTimeMs: number): boolean {
   return Date.now() - createTimeMs > MESSAGE_MAX_AGE_MS;
 }
 
+// 幂等命令豁免：用户会合法地连续重发这些命令，不做内容去重
+const DEDUP_EXEMPT_COMMANDS = ["/new", "/switch", "/status", "/cancel"];
+
 function isCommandDuplicate(chatId: string, text: string): boolean {
   if (!text.startsWith("/")) return false; // 只对命令去重
+  const cmd = text.split(/\s+/)[0].toLowerCase();
+  if (DEDUP_EXEMPT_COMMANDS.includes(cmd)) return false; // 幂等命令允许连发
   const key = `${chatId}:${text}`;
   const now = Date.now();
   const lastSeen = recentCommands.get(key);
@@ -88,7 +93,7 @@ const dispatcher = new lark.EventDispatcher({}).register({
     const messageId = message.message_id!;
     const chatId = message.chat_id!;
     const createTime = message.create_time!;
-    const createTimeMs = Number(createTime) * 1000;
+    const createTimeMs = Number(createTime); // 飞书 create_time 已是毫秒级
     const ageSeconds = Math.round((Date.now() - createTimeMs) / 1000);
 
     // 打印原始时间戳用于调试
