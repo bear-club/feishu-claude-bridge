@@ -1,343 +1,242 @@
 # Feishu Claude Bridge
 
-通过飞书机器人远程操控本机 Claude Code 的桥接服务。
+通过飞书机器人远程操控本机 Claude Code 的桥接服务。在飞书中发送消息，即可驱动本地 Claude Code 执行任务并返回结果，支持持续对话、多项目切换、并发控制和危险操作的飞书交互式审批。
 
-## 项目目标
+## 功能特性
 
-- 通过飞书机器人向本机 Claude Code 发送指令
-- 接收 Claude Code 的执行结果并返回到飞书
-- 支持多对话管理（新建、切换、列出对话）
+- **远程操控** — 飞书发消息即可调用本机 Claude Code，无需打开终端
+- **持续对话** — 基于 Claude Agent SDK session 机制，同一会话内保持完整上下文
+- **多会话管理** — 同一聊天可维护多个会话，通过 `/new` `/switch` 在不同工作目录间切换
+- **分级权限审批** — 三档策略：全部放行 / 危险操作飞书审批 / 仅只读，审批通过才执行，拒绝即真正阻断
+- **实时进度** — 执行过程中通过飞书卡片实时更新工具调用与输出
+- **并发控制** — 每个会话串行任务队列（最多排队 3 个），防止 SDK 并发冲突
+- **长输出处理** — 超过飞书限制时自动分片发送，内容完整不丢失
+- **目录白名单** — 工作目录受 `ALLOWED_DIRS` 限制，防止访问敏感路径
+- **无需公网 IP** — 飞书 WebSocket 长连接，本地即可运行
 
-## 架构设计
+## 架构
 
 ```
-飞书用户 → 飞书服务器 → 本机桥接服务 → Claude Agent SDK → 返回结果 → 飞书消息
-                     (WebSocket 长连接)
+飞书用户 ──→ 飞书服务器 ──WebSocket──→ 本机桥接服务 ──→ Claude Agent SDK ──→ 结果返回飞书
 ```
 
-### 核心组件
-
-| 组件 | 说明 |
-|------|------|
-| 飞书机器人 | 飞书开放平台自建应用，接收/发送消息 |
-| 桥接服务 | 本机运行的 Node.js 服务，处理消息转发和对话管理 |
-| Claude Agent SDK | `@anthropic-ai/claude-agent-sdk`，程序化调用 Claude Code |
-| 对话管理 | 维护飞书会话与 Claude Agent SDK session ID 的映射 |
-| 任务队列 | 每个 session 维护一个串行任务队列，防止并发调用冲突 |
-
-### 数据流
-
-1. 用户在飞书中发送消息给机器人
-2. 飞书服务器通过 WebSocket 长连接推送事件到本机桥接服务
-3. 桥接服务解析消息，根据飞书会话查找或创建对应的 Claude session
-4. 将任务加入该 session 的串行队列
-5. 立即回复用户"正在执行..."
-6. 调用 Claude Agent SDK 执行指令（支持流式输出）
-7. 执行完成后主动推送结果消息给用户
-
-## 技术选型
-
-| 技术 | 选择 | 理由 |
+| 组件 | 技术 | 说明 |
 |------|------|------|
-| 运行时 | Node.js | Claude Agent SDK 原生支持 TypeScript |
-| Claude Code 调用 | `@anthropic-ai/claude-agent-sdk` | 支持流式输出、session 恢复、hooks、子代理等完整能力 |
-| 飞书通信 | `@larksuiteoapi/node-sdk` WebSocket 长连接 | 无需公网 IP，无需 ngrok/frp 内网穿透，SDK 内置事件分发 |
-| 对话存储 | 本地 JSON 文件 | 轻量持久化，存储会话映射关系 |
+| 消息通道 | `@larksuiteoapi/node-sdk` WebSocket | 无需公网 IP，SDK 内置事件分发 |
+| AI 调用 | `@anthropic-ai/claude-agent-sdk` | 流式输出、session 恢复、任务取消、权限 hook |
+| 会话存储 | 本地 JSON 文件 | 轻量持久化，映射飞书会话到 Claude session |
 
-> **注意**：飞书 SDK 自带 WebSocket 事件分发机制，不需要额外的 HTTP 框架（Express/Fastify）来接收消息。仅在需要健康检查或管理面板时才引入 HTTP 服务。
+## 快速开始
 
-## Claude Agent SDK 调用方式
+### 前置条件
 
-### 关于持续对话（核心机制）
+- Node.js >= 18
+- Claude Code CLI 已安装并登录（`claude --version` 可用）
+- 飞书开放平台自建应用（见下方配置说明）
 
-`claude -p` 是单次调用，不包含上下文，无法持续对话。要实现和在终端中使用 Claude Code 一样的连续对话体验，需要使用 **Claude Agent SDK 的 session 机制**：
+### 安装
 
-1. **首次调用**：SDK 返回的消息流中包含 `session_id`，从 `init` 类型的 system 消息中提取
-2. **后续调用**：通过 `resume: sessionId` 参数恢复会话，Claude 会拥有之前所有的上下文（读过的文件、做过的分析、对话历史）
+```bash
+git clone https://github.com/bear-club/feishu-claude-bridge.git
+cd feishu-claude-bridge
+npm install
+```
 
-这等价于你在终端中持续和 Claude Code 对话——Claude 记得之前所有的交互。
+### 配置
 
-### SDK 代码示例
+复制环境变量模板并填入实际值：
+
+```bash
+cp .env.example .env
+```
+
+| 环境变量 | 必填 | 默认值 | 说明 |
+|----------|:----:|--------|------|
+| `FEISHU_APP_ID` | ✅ | — | 飞书应用 App ID |
+| `FEISHU_APP_SECRET` | ✅ | — | 飞书应用 App Secret |
+| `DEFAULT_CWD` | ✅ | — | Claude 执行的默认工作目录 |
+| `ALLOWED_DIRS` | ✅ | — | 允许的工作目录白名单（逗号分隔） |
+| `CLAUDE_MODEL` | | `claude-opus-4-6` | Claude 模型 |
+| `CLAUDE_ALLOWED_TOOLS` | | `Read,Glob,Grep,Edit,Write,Bash` | Claude 可用工具（逗号分隔） |
+| `CLAUDE_PERMISSION_POLICY` | | `bypass` | 权限策略：`bypass` / `cautious` / `strict` |
+| `CLAUDE_SAFE_TOOLS` | | — | 额外自动放行工具（仅 cautious/strict 生效） |
+| `CLAUDE_DANGEROUS_PATTERNS` | | 内置默认列表 | 危险命令模式（仅 cautious 生效） |
+| `CLAUDE_APPROVAL_TIMEOUT_MS` | | `60000` | 审批超时毫秒数，超时自动拒绝 |
+| `SHORTCUT_DIRS` | | — | `/new` 指令展示的快捷目录（逗号分隔） |
+
+最小可运行配置示例：
+
+```env
+FEISHU_APP_ID=cli_xxx
+FEISHU_APP_SECRET=xxx
+DEFAULT_CWD=D:\play\feishu-claude-bridge
+ALLOWED_DIRS=D:\play,D:\projects
+```
+
+### 运行
+
+```bash
+npm start          # 启动服务
+npm run dev        # 开发模式（热重载）
+```
+
+启动后在飞书中搜索机器人名称，发送消息即可开始使用。
+
+## 指令说明
+
+| 指令 | 必填字段 | 说明 |
+|------|----------|------|
+| 直接发消息 | — | 向当前会话的 Claude 发送指令，保持上下文 |
+| `/new [编号\|路径]` | 路径需在 `ALLOWED_DIRS` 白名单内 | 创建新会话；无参数时列出快捷目录与最近使用目录供选编号 |
+| `/switch [编号]` | 编号（无参数时仅列出会话） | 在同一聊天的多个会话间切换 |
+| `/status` | — | 查看当前会话状态、工作目录、最后活跃时间 |
+| `/cancel` | — | 取消正在执行的任务并清空排队队列 |
+
+审批回复（仅当有待审批操作时生效）：
+
+| 回复 | 含义 |
+|------|------|
+| `y` / `yes` / `ok` / `allow` | 批准执行该操作 |
+| `n` / `no` / `deny` / `reject` | 拒绝该操作 |
+| `/cancel` | 拒绝审批并取消整个任务 |
+
+## 权限审批机制
+
+通过 `CLAUDE_PERMISSION_POLICY` 选择策略，对每次工具调用做风险分级：
+
+| 策略 | 只读工具（Read/Glob/Grep） | 普通操作（如普通 Bash） | 危险操作（rm / git push / DROP TABLE 等） |
+|------|------|------|------|
+| `bypass`（默认） | 放行 | 放行 | 放行 |
+| `cautious` | 放行 | 通知后放行 | **发飞书卡片审批，等用户回复** |
+| `strict` | 放行 | 拒绝 | 拒绝 |
+
+- **危险操作识别**：`Bash` 命令匹配 `CLAUDE_DANGEROUS_PATTERNS`（留空时使用内置 30+ 默认模式，含 `rm`、`del`、`git push/reset --hard`、`DROP TABLE`、`shutdown` 等）即判为危险。
+- **可靠阻断**：危险操作审批通过 `PreToolUse` hook 实现 —— 用户回复 `n` 或超时即真正阻止工具执行，不会出现"已拒绝但操作仍发生"。
+- **审批超时**：`CLAUDE_APPROVAL_TIMEOUT_MS` 内（默认 60 秒）未回复自动拒绝。
+- **自动放行**：`Read/Glob/Grep` 始终放行；通过 `CLAUDE_SAFE_TOOLS` 可追加额外免审批工具（如 `Edit,Write`）。
+
+## 数据流转示例
+
+以「在 cautious 模式下请求删除文件」为例：
+
+```
+1. 飞书用户发送        "删除 D:/play/tmp/old.txt"
+       │
+2. 桥接服务接收        feishu.ts WebSocket 收到 im.message.receive_v1，去重后交给 handler
+       │
+3. 入队执行            task-queue.ts 串行入队 → executeClaude 发送「⏳ 执行中」进度卡片
+       │
+4. 调用 Claude         claude.ts query() 流式执行，恢复上一轮 session 上下文
+       │
+5. 工具拦截            Claude 决定执行 `rm` → PreToolUse hook 判定为危险操作
+       │
+6. 飞书审批            发送「🔐 权限审批」红色卡片，提示回复 y/n（60s 内）
+       │
+   ┌───┴────────────────────────┐
+   │ 用户回复 y                  │ 用户回复 n / 超时
+   ▼                            ▼
+7a. hook 放行 → 工具执行       7b. hook 拒绝 → 工具不执行
+    文件被删除                     文件保留，卡片更新「❌ 已拒绝」
+   │                            │
+   └───┬────────────────────────┘
+       │
+8. 结果返回            executeClaude 收集结果 → 更新进度卡片为「✅ 执行完成」
+       │              超长输出按 28KB 边界分片，多张卡片顺序发送
+       │
+9. 会话持久化          session-store.ts 写入新的 sessionId / lastActiveAt / lastPrompt
+```
+
+只读或普通操作（如「读取 README」）跳过第 6 步，进度卡片实时显示工具调用日志后直接返回结果。
+
+## Claude Agent SDK 调用机制
+
+本项目使用 `@anthropic-ai/claude-agent-sdk` 实现与 Claude Code 的程序化交互，核心能力：
+
+- **Session 恢复**：首次调用获取 `session_id`，后续通过 `resume` 参数恢复上下文，实现连续对话
+- **流式输出**：实时获取 Claude 执行进度，用于更新飞书卡片
+- **权限 hook**：通过 `PreToolUse` hook 在工具执行前介入，实现可靠的危险操作审批与阻断
+- **任务取消**：通过 `AbortController` 中断正在执行的调用
+- **错误降级**：session 恢复失败时自动新建会话，保证服务可用
 
 ```typescript
 import { query } from "@anthropic-ai/claude-agent-sdk";
 
-// === 首次调用：创建新会话 ===
-let sessionId: string | undefined;
-
+// 首次调用 — 创建新会话，并挂载权限 hook
 for await (const message of query({
-  prompt: "读取 src/index.ts 并分析代码结构",
-  options: {
-    cwd: "/your/project/path",
-    allowedTools: ["Read", "Glob", "Grep", "Edit", "Write", "Bash"],
-  }
+  prompt: "分析代码结构",
+  options: { cwd, hooks: { PreToolUse: [{ hooks: [preToolUseHook] }] } },
 })) {
-  // 从 init 消息中提取 session ID
-  if (message.type === "system" && message.subtype === "init") {
-    sessionId = message.session_id;
-  }
-  // 提取最终结果
-  if ("result" in message) {
-    console.log(message.result);
-  }
+  if (message.type === "system" && message.subtype === "init")
+    sessionId = message.session_id;  // 保存用于后续恢复
+  if (message.type === "result")
+    return message.result;
 }
 
-// === 后续调用：恢复会话，拥有完整上下文 ===
-for await (const message of query({
-  prompt: "基于刚才的分析，重构那个函数",  // "那个函数" — Claude 知道你指的是什么
-  options: {
-    resume: sessionId,  // 关键：传入 session ID 恢复上下文
-  }
-})) {
-  if ("result" in message) {
-    console.log(message.result);
-  }
+// 后续调用 — 恢复上下文
+for await (const message of query({ prompt: "重构那个函数", options: { resume: sessionId } })) {
+  // Claude 记得之前所有交互
 }
 ```
 
-### CLI 模式（备选，无连续对话能力）
-
-```bash
-# 单次调用，无上下文
-claude -p "你的指令"
-
-# 注意：-p 模式每次都是全新会话，无法实现连续对话
-```
-
-## 飞书机器人指令设计
-
-| 指令 | 说明 |
-|------|------|
-| 直接发消息 | 在当前会话中向 Claude Code 发送指令（保持上下文） |
-| `/new` | 弹出目录选择卡片，创建新会话 |
-| `/switch` | 弹出项目/会话选择卡片，切换上下文 |
-| `/cancel` | 取消当前正在执行的任务 |
-| `/status` | 查看当前会话状态 |
-
-> 原来的 `/list`、`/cwd` 已合并到 `/switch` 的卡片交互中，减少用户手动输入。
-
-### 交互式卡片设计
-
-飞书卡片不支持二级嵌套选择，但支持**回调后更新卡片内容**，用两步卡片交互实现等效体验。
-
-#### `/new` — 新建会话
+## 项目结构
 
 ```
-用户：/new
-
-┌──────────────────────────────────┐
-│  📂 选择工作目录                  │
-│                                  │
-│  最近使用：                       │
-│  [D:\projects\backend]           │ ◀── 按钮，点击直接创建
-│  [D:\projects\mobile]            │
-│  [D:\play\feishu-bridge]         │
-│                                  │
-│  手动输入路径：                    │
-│  ┌──────────────────────┐        │
-│  │                      │        │
-│  └──────────────────────┘        │
-│            [确认]                 │
-└──────────────────────────────────┘
+src/
+├── index.ts            # 入口：前置检查、注册 handler、启动 WebSocket
+├── feishu.ts           # 飞书客户端封装：消息收发、卡片更新、消息去重
+├── claude.ts           # Claude Agent SDK 调用封装：流式处理、session 管理、hook 透传
+├── handler.ts          # 消息处理中心：指令分发、审批拦截、卡片构建、任务编排
+├── permission.ts       # 权限分级与审批：风险分类、PreToolUse hook、飞书审批卡片
+├── session-store.ts    # 会话存储：多会话 JSON 持久化 + 异步写锁 + 旧格式迁移
+├── command-parser.ts   # 指令解析：/command 格式识别
+├── path-guard.ts       # 路径白名单校验
+├── preflight.ts        # Claude CLI 可用性前置检查
+├── task-queue.ts       # 串行任务队列 + 取消支持
+└── split-message.ts    # 消息分片：按字节拆分，保留换行边界
 ```
 
-- 历史目录从会话存储中提取去重，按最近使用时间排序
-- 按钮组件（`button`）展示历史路径，点击即创建
-- 输入框组件（`input`）+ 按钮用于手动输入新路径
-- 首次使用无历史记录时，只展示输入框
+## 飞书开放平台配置
 
-#### `/switch` — 切换项目/会话（两步卡片）
+1. 进入 [飞书开放平台](https://open.feishu.cn/) → 创建企业自建应用
+2. 开启「机器人」能力
+3. 记录 `App ID` 和 `App Secret`
+4. 事件订阅：添加 `im.message.receive_v1`，选择 **WebSocket 模式**
+5. 权限申请：`im:message`、`im:message:send_as_bot`、`im:resource`
+6. 可见范围：按需配置（开发阶段建议仅对自己可见）
+7. 发布应用版本
 
-**第一步：选择项目目录**
+## 设计要点
 
-```
-用户：/switch
+### 多会话存储
 
-┌──────────────────────────────────┐
-│  📂 选择项目                      │
-│                                  │
-│  [D:\projects\backend]  2个会话   │ ◀── 按钮，点击进入第二步
-│  [D:\projects\mobile]   1个会话   │
-│  [D:\play\feishu-bridge] 1个会话  │
-└──────────────────────────────────┘
-```
-
-**第二步：卡片原地刷新，展示该项目下的会话列表**
-
-```
-用户点击了 D:\projects\backend → 卡片原地更新
-
-┌──────────────────────────────────────┐
-│  D:\projects\backend 的会话           │
-│                                      │
-│  [💬 10分钟前 — "加上分页功能..."]     │ ◀── 点击直接切换
-│  [💬 2天前 — "修复登录bug..."]        │
-│                                      │
-│  [＋ 创建新会话]       [◀ 返回]       │
-└──────────────────────────────────────┘
-```
-
-**技术实现**：
-
-1. 用户点击按钮 → 飞书通过 `card.action.trigger` 回调推送事件
-2. 服务端收到回调 → 返回新的卡片 JSON
-3. 飞书原地替换卡片内容 → 用户看到第二步界面
-4. 用户在第二步点击会话 → 回调切换 session，卡片更新为确认信息
-
-> 飞书卡片按钮回调返回新卡片即可实现"原地刷新"效果，无需前端开发，对用户来说体验流畅。使用的组件均为飞书卡片基础组件：`button`（按钮）、`select_static`（下拉选择）、`input`（输入框），兼容性好。
-
-## 关键设计
+每个飞书聊天（`chatId`）维护一组会话，记录 `activeId` 与 `sessions` 列表。`/new` 追加并激活新会话，`/switch` 切换激活会话，`getRecentDirs` 汇总最近工作目录用于 `/new` 编号选择。存储为单一 JSON 文件，写入经异步锁串行化，并兼容旧版单会话格式自动迁移。
 
 ### 并发控制
 
-Claude Agent SDK 同一个 session 不支持并发调用。如果用户连续发了两条消息，必须串行处理：
+Claude Agent SDK 同一 session 不支持并发调用。本项目为每个会话维护 FIFO 任务队列（最多 3 个排队），保证串行执行。超出队列深度的请求会被拒绝并提示用户。
 
-```
-用户消息1 → 加入队列 → 立即执行
-用户消息2 → 加入队列 → 等待消息1执行完毕后执行
-```
+### 输出分片
 
-实现方案：每个 session 维护一个 FIFO 任务队列，保证同一 session 内的请求串行执行。
+飞书卡片消息限制约 30KB。超长输出按 28KB 字节边界拆分，优先在换行符处断开，分片标注序号顺序发送。
 
-### 任务取消
+### 安全机制
 
-用户发送 `/cancel` 时，通过 `AbortController` 中断正在执行的 Claude Agent SDK 调用：
+- 工作目录白名单（`ALLOWED_DIRS`）：所有路径经 `path.resolve()` 规范化后校验
+- 分级权限审批（`CLAUDE_PERMISSION_POLICY`）：危险操作经 `PreToolUse` hook 飞书审批，拒绝即真正阻断
+- Claude CLI 前置检查：启动时验证 CLI 可用，不可用则退出
+- 飞书应用可见范围：通过平台配置限制可调用用户
 
-```typescript
-const controller = new AbortController();
+## 调试
 
-// 执行任务时传入 signal
-for await (const message of query({
-  prompt: "...",
-  options: { resume: sessionId },
-  signal: controller.signal,
-})) {
-  // ...
-}
+| 场景 | 方法 |
+|------|------|
+| WebSocket 连接失败 | 检查 App ID/Secret、应用是否已发布、事件订阅模式 |
+| 消息发送 403 | 检查权限是否申请并通过审批 |
+| Claude 执行超时 | 终端运行 `claude -p "test"` 确认 CLI 可用 |
+| 审批拒绝后操作仍发生 | 确认 `CLAUDE_PERMISSION_POLICY=cautious` 且危险命令命中模式 |
+| Session 恢复失败 | 日志会打印降级信息，自动新建会话 |
+| 会话数据损坏 | 删除 `data/sessions.json`，会自动重建 |
 
-// 用户发送 /cancel 时
-controller.abort();
-```
+## License
 
-### 异步执行与进度反馈
-
-Claude Code 执行复杂任务可能耗时较长（几秒到几分钟），飞书事件回调有超时限制。处理策略：
-
-1. 收到消息后立即回复"正在执行..."（飞书卡片消息）
-2. 异步调用 Claude Agent SDK
-3. 利用流式输出实时更新飞书卡片消息（通过卡片更新 API 展示执行进度）
-4. 执行完成后更新卡片为最终结果
-5. 超时（可配置，默认 5 分钟）后通知用户并中断执行
-
-### 输出处理
-
-Claude Code 的输出可能很长，飞书消息有大小限制：
-
-| 消息类型 | 大小限制 |
-|----------|----------|
-| 普通文本消息 | ~4000 字符 |
-| 卡片消息 (interactive card) | ~30KB |
-
-处理策略：
-- **优先使用飞书卡片消息**，承载更多内容且支持实时更新
-- **智能截断**：超长输出保留开头 + 结尾 + 错误信息，中间折叠
-- **分段发送**：单次输出超过卡片上限时，拆分为多条消息
-- **文件附件**：极长输出（如完整代码文件）上传为飞书文件附件
-
-### 消息类型解析
-
-SDK 返回的消息流包含多种类型，需要提取用户可读的内容：
-
-```typescript
-for await (const message of query({ prompt, options })) {
-  switch (true) {
-    case message.type === "system" && message.subtype === "init":
-      // 提取 session_id 用于后续恢复
-      sessionId = message.session_id;
-      break;
-    case "result" in message:
-      // 最终结果文本，发送给飞书用户
-      sendToFeishu(message.result);
-      break;
-    // 其他消息类型可用于进度展示
-  }
-}
-```
-
-### 安全性
-
-- **用户限制**：通过飞书应用可见范围配置，限制可调用机器人的用户
-- **工作目录白名单**：`/new` 和 `/switch` 创建会话时校验路径是否在允许列表内，防止访问敏感目录
-- **路径验证**：创建会话前验证目录是否存在
-- **敏感操作确认**：对文件删除、git push 等操作，通过飞书卡片按钮让用户二次确认
-- **权限模式**：SDK 支持 `permissionMode` 配置，可限制 Claude 能使用的工具
-
-### 会话存储
-
-使用本地 JSON 文件存储飞书会话与 Claude session 的映射关系：
-
-```json
-{
-  "feishu_chat_id_1": {
-    "sessionId": "claude-session-xxx",
-    "cwd": "/path/to/project",
-    "createdAt": "2026-05-20T10:00:00Z",
-    "lastActiveAt": "2026-05-20T12:30:00Z"
-  }
-}
-```
-
-## 实现路线
-
-### 第一阶段：基础功能
-
-1. 搭建 Node.js + TypeScript 项目，集成 Claude Agent SDK
-2. 实现飞书机器人消息收发（WebSocket 长连接）
-3. 实现单会话的指令发送和结果返回
-4. 异步执行 + "正在执行..."即时反馈
-
-### 第二阶段：对话管理
-
-5. 实现会话映射存储（飞书会话 ↔ Claude session ID）
-6. 实现 session 恢复，支持同一飞书会话内的连续对话
-7. 实现 `/new` 卡片交互（历史目录按钮 + 手动输入）
-8. 实现 `/switch` 两步卡片交互（选目录 → 选会话，卡片原地刷新）
-
-### 第三阶段：健壮性
-
-9. 并发控制：每个 session 的串行任务队列
-10. 任务取消：`/cancel` + AbortController
-11. 超时处理：可配置的执行超时 + 用户通知
-12. 长输出处理：智能截断 / 分段发送 / 文件附件
-
-### 第四阶段：体验优化
-
-13. 流式输出实时更新飞书卡片消息
-14. 卡片消息美化（代码块、折叠区域、操作按钮）
-15. 错误处理与友好提示
-
-### 第五阶段：安全与运维
-
-16. 工作目录白名单
-17. 敏感操作确认机制
-18. 用户权限控制
-19. 日志记录与监控
-
-## 飞书开放平台配置清单
-
-- [ ] 创建企业自建应用
-- [ ] 启用机器人能力
-- [ ] 获取 App ID 和 App Secret
-- [ ] 配置事件订阅（`im.message.receive_v1`）
-- [ ] 选择 WebSocket 长连接模式
-- [ ] 配置应用可见范围（限制可操控用户）
-- [ ] 申请必要的 API 权限（发送消息、更新消息等）
-
-## 依赖
-
-```json
-{
-  "@anthropic-ai/claude-agent-sdk": "latest",
-  "@larksuiteoapi/node-sdk": "latest"
-}
-```
+ISC

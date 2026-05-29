@@ -19,6 +19,33 @@ function isDuplicate(messageId: string): boolean {
   return false;
 }
 
+// 消息年龄检测：超过此时间的消息视为飞书重放，直接丢弃
+const MESSAGE_MAX_AGE_MS = 60_000; // 60 秒
+
+// 命令内容去重：防止飞书用新 message_id 重放旧命令（兜底）
+const recentCommands = new Map<string, number>();
+const COMMAND_DEDUP_WINDOW_MS = 5 * 60_000; // 5 分钟
+
+function isStaleMessage(createTimeMs: number): boolean {
+  return Date.now() - createTimeMs > MESSAGE_MAX_AGE_MS;
+}
+
+function isCommandDuplicate(chatId: string, text: string): boolean {
+  if (!text.startsWith("/")) return false; // 只对命令去重
+  const key = `${chatId}:${text}`;
+  const now = Date.now();
+  const lastSeen = recentCommands.get(key);
+  if (lastSeen && now - lastSeen < COMMAND_DEDUP_WINDOW_MS) return true;
+  recentCommands.set(key, now);
+  // 清理过期条目
+  if (recentCommands.size > 500) {
+    for (const [k, ts] of recentCommands) {
+      if (now - ts > COMMAND_DEDUP_WINDOW_MS) recentCommands.delete(k);
+    }
+  }
+  return false;
+}
+
 export async function sendText(chatId: string, text: string): Promise<string | undefined> {
   const resp = await client.im.message.create({
     params: { receive_id_type: "chat_id" },
@@ -59,12 +86,34 @@ const dispatcher = new lark.EventDispatcher({}).register({
     if (!message) return;
 
     const messageId = message.message_id!;
+    const chatId = message.chat_id!;
+    const createTime = message.create_time!;
+    const createTimeMs = Number(createTime) * 1000;
+    const ageSeconds = Math.round((Date.now() - createTimeMs) / 1000);
+
+    // 打印原始时间戳用于调试
+    console.log(`[消息时间] mid=${messageId.slice(-8)} create_time=${createTime} age=${ageSeconds}s`);
+
     if (isDuplicate(messageId)) {
       console.log(`[去重] 跳过重复消息 ${messageId}`);
       return;
     }
 
-    const chatId = message.chat_id!;
+    // 消息年龄检测：丢弃飞书重放的过期消息
+    if (isStaleMessage(createTimeMs)) {
+      console.log(`[过期消息] 跳过 age=${ageSeconds}s chat=${chatId}`);
+      return;
+    }
+
+    // 命令内容去重：兜底防止重放命令
+    if (message.message_type === "text") {
+      const content = JSON.parse(message.content!);
+      const text = (content.text as string).trim();
+      if (isCommandDuplicate(chatId, text)) {
+        console.log(`[命令去重] 跳过重放命令 chat=${chatId} text="${text}"`);
+        return;
+      }
+    }
 
     // #12 非文本消息反馈
     if (message.message_type !== "text") {
